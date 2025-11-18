@@ -34,7 +34,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from Embedder import Embedder
+from POP.Embedder import Embedder
 from POP import PromptFunction
 
 
@@ -151,80 +151,114 @@ class ConversationMemory:
 
 
 class DiskMemory:
-    """Persistent memory stored on disk.
+    """
+    Persistent text+vector memory split across two files:
+      - <base>.text.jsonl        (one {"text": "..."} per line)
+      - <base>.embeddings.npy    (float32 array, shape = [N, D])
 
-    This class mirrors the in‑memory behaviour of `ConversationMemory` but
-    persists its contents to a JSON file.  It loads existing entries
-    on instantiation and writes out to disk whenever a new entry is
-    added.  Each entry is stored as a dictionary with a ``text`` key
-    and an ``embedding`` key (the latter being a list of floats to
-    maintain JSON serialisability).
-
-    Parameters
-    ----------
-    filepath : str
-        Path to the JSON file used for storage.  If the file does not
-        exist it will be created on first write.
-    embedder : Embedder
-        The embedder used to compute embeddings for new entries.
-    max_entries : int, optional
-        Maximum number of entries to keep on disk.  When the limit
-        is exceeded, the oldest entries are removed.  Defaults to
-        ``1000``.
+    Lines and rows are aligned by index: line i ↔ row i.
     """
 
     def __init__(self, filepath: str, embedder: Embedder, max_entries: int = 1000) -> None:
-        self.filepath = filepath
+        self.base = os.path.splitext(filepath)[0] if filepath.endswith(".jsonl") else filepath
+        self.text_path = f"{self.base}.text.jsonl"
+        self.emb_path  = f"{self.base}.embeddings.npy"
+
         self.embedder = embedder
         self.max_entries = max_entries
-        self.entries: List[dict] = []
-        self._load()
 
-    def _load(self) -> None:
-        """Load memory entries from a JSONL file if it exists."""
-        if os.path.exists(self.filepath):
-            try:
-                with open(self.filepath, "r", encoding="utf-8") as f:
-                    self.entries = [json.loads(line) for line in f if line.strip()]
+        os.makedirs(os.path.dirname(self.text_path) or ".", exist_ok=True)
 
-            except (json.JSONDecodeError, OSError):
-                # If the file is corrupt or unreadable, start with empty memory
-                self.entries = []
+        # Lightweight line count cache
+        self._n_text = self._count_lines(self.text_path)
 
-    def _save(self) -> None:
-        """Persist the current entries to disk as JSONL (one JSON per line)."""
-        try:
-            with open(self.filepath, "w", encoding="utf-8") as f:
-                for rec in self.entries[-self.max_entries:]:
-                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        except OSError:
-            # Ignore write errors silently
-            pass
-
+    # ---------- public API ----------
     def add(self, text: str) -> None:
-        """Add a new memory entry and persist it."""
-        embedding = self.embedder.get_embedding([text])[0]
-        self.entries.append({"text": text, "embedding": embedding.tolist()})
-        # Truncate and save
-        self.entries = self.entries[-self.max_entries :]
-        self._save()
+        """Append text to JSONL and its vector to .npy; prune if needed."""
+        # 1) text
+        with open(self.text_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
+        self._n_text += 1
+
+        # 2) vector
+        vec = self.embedder.get_embedding([text])[0].astype("float32")
+        if os.path.exists(self.emb_path):
+            M = np.load(self.emb_path, mmap_mode=None, allow_pickle=False)
+            M = np.vstack([M, vec[None, :]])
+        else:
+            M = vec[None, :]
+        np.save(self.emb_path, M)
+
+        # 3) prune both synchronously if over limit
+        self._prune()
 
     def retrieve(self, query: str, top_k: int = 3) -> List[str]:
-        """Retrieve the top matching entries from long‑term storage."""
-        if not self.entries:
+        """Embed query, cosine-search over .npy, return matching text lines."""
+        if not os.path.exists(self.emb_path) or self._n_text == 0:
             return []
-        # Compute query embedding
-        query_emb = self.embedder.get_embedding([query])[0]
-        # Compute similarity scores
-        scores = [
-            _cosine_similarity(query_emb, np.array(entry["embedding"]))
-            for entry in self.entries
-        ]
-        if top_k <= 0:
-            top_k = 1
-        top_indices = np.argsort(scores)[-top_k:][::-1]
-        return [self.entries[i]["text"] for i in top_indices]
 
+        Q = self.embedder.get_embedding([query])[0].astype("float32")
+        M = np.load(self.emb_path, mmap_mode="r")  # memory-map for big files
+
+        # Normalize (safe against zeros)
+        def _norm(x): 
+            n = np.linalg.norm(x, axis=-1, keepdims=True)
+            n[n == 0] = 1.0
+            return x / n
+
+        Qn = _norm(Q[None, :])[0]
+        Mn = _norm(M)
+
+        sims = (Mn @ Qn).astype("float32")
+        k = max(1, min(top_k, sims.shape[0]))
+        idx = np.argpartition(-sims, k-1)[:k]
+        idx = idx[np.argsort(-sims[idx])]
+
+        # Fetch those text lines by index
+        return self._read_lines_by_index(idx.tolist())
+
+    # ---------- helpers ----------
+    def _read_lines_by_index(self, indices: List[int]) -> List[str]:
+        """Read specific lines from JSONL by index (0-based)."""
+        out = []
+        wanted = set(indices)
+        max_i = max(indices) if indices else -1
+        with open(self.text_path, "r", encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                if i in wanted:
+                    try:
+                        out.append(json.loads(line)["text"])
+                    except Exception:
+                        out.append(line.strip())
+                if i >= max_i and len(out) == len(indices):
+                    break
+        # Ensure order matches `indices`
+        order = {v: i for i, v in enumerate(indices)}
+        return [t for _, t in sorted(zip(indices, out), key=lambda p: order[p[0]])]
+
+    def _count_lines(self, path: str) -> int:
+        if not os.path.exists(path): return 0
+        with open(path, "rb") as f:
+            return sum(1 for _ in f)
+
+    def _prune(self) -> None:
+        """Keep only newest `max_entries` lines/rows across both files."""
+        if self._n_text <= self.max_entries:
+            return
+        keep = self.max_entries
+
+        # 1) prune text: keep last `keep` lines
+        with open(self.text_path, "rb") as f:
+            lines = f.readlines()[-keep:]
+        with open(self.text_path, "wb") as f:
+            f.writelines(lines)
+        self._n_text = keep
+
+        # 2) prune vectors: keep last `keep` rows
+        if os.path.exists(self.emb_path):
+            M = np.load(self.emb_path, mmap_mode=None, allow_pickle=False)
+            if len(M) > keep:
+                np.save(self.emb_path, M[-keep:])
 
 class PIAssistant:
     """A personal assistant that uses PromptFunction and vector memory.
